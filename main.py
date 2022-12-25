@@ -1,9 +1,13 @@
 import asyncio
 import json
 import datetime
-import dateutil
 import re
 import math
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG, format="[%(asctime)s] %(levelname)s: %(message)s"
+)
 
 # read config file
 with open("config.json") as f:
@@ -45,9 +49,9 @@ class ClientState:
     def update(self, away: bool, away_message: str) -> str:
         away_message = unescape_space(away_message)
         if away != self.away:
-            print(f"away: {away} {away_message}")
+            logging.debug(f"away: {away} {away_message}")
         if away_message != self.away_message:
-            print(f"away_message: {away_message}")
+            logging.debug(f"away_message: {away_message}")
         self.away_message = away_message
         self.away = away
         if not away:
@@ -67,73 +71,94 @@ class ClientState:
 async def client():
     state = ClientState()
     while True:
-        reader, writer = await asyncio.open_connection(config["host"], config["port"])
-
-        async def query(q: str, lines: int = 1) -> list[str]:
-            writer.write(f"{q}\n".encode("utf-8"))
-            await writer.drain()
-            response = []
-            for _ in range(lines):
-                response.append((await reader.readline()).decode("utf-8").strip())
-            return response
-
-        # skip the first 4 lines
-        for _ in range(4):
-            await reader.readline()
-
-        # authenticate with api key
-        result = await query(f"auth apikey={config['api_key']}")
-        if result[0] != "error id=0 msg=ok":
-            print("authentication failed")
-            break
-
-        while True:
-            await asyncio.sleep(5)
-            # retry if the connection is closed
-            if writer.is_closing():
-                break
-            if reader.at_eof():
-                break
-
-            # query whoami
-            whoami = await query("whoami", 2)
-            if whoami[1] != "error id=0 msg=ok":
-                print(f"whoami failed: {whoami[1]}")
-                break
-            # parse clid=<client id> cid=<channel id>
-            match = re.match(r"clid=(\d+) cid=(\d+)", whoami[0])
-            if match is None:
-                continue
-            clid = int(match.group(1))
-            print(f"clid: {clid}")
-
-            # query the away status and away message
-            away = await query(
-                f"clientvariable clid={clid} client_away client_away_message", 2
+        await asyncio.sleep(3)
+        try:
+            reader, writer = await asyncio.open_connection(
+                config["host"], config["port"]
             )
-            if away[1] != "error id=0 msg=ok":
-                print(f"clientvariable failed: {away[1]}")
-                break
-            # parse response: clid=<clid> client_away=<away> client_away_message=<away_text>
-            match = re.match(
-                r"clid=\d+ client_away=(\d) client_away_message=?(.*)", away[0]
-            )
-            if match is None:
-                continue
-            away = bool(int(match.group(1)))
-            away_message = match.group(2)
 
-            # update the state
-            status = state.update(away, away_message)
-            print(f"calculated status: {status}")
-            if status != "":
-                # set status
-                update = await query(
-                    f"clientupdate client_away_message={escape_space(status)}"
-                )
-                if update[0] != "error id=0 msg=ok":
-                    print(f"clientupdate failed: {update[0]}")
+            async def query(q: str, lines: int = 1) -> list[str]:
+                writer.write(f"{q}\n".encode("utf-8"))
+                await writer.drain()
+                response = []
+                error_line = None
+                for _ in range(lines):
+                    if error_line is not None:
+                        response.append(error_line)
+                        continue
+                    line = (
+                        (await asyncio.wait_for(reader.readline(), 10))
+                        .decode("utf-8")
+                        .strip()
+                    )
+                    if line.startswith("error"):
+                        error_line = line
+                    response.append(line)
+                return response
+
+            # skip the first 4 lines
+            for _ in range(4):
+                await reader.readline()
+
+            # authenticate with api key
+            result = await query(f"auth apikey={config['api_key']}")
+            if result[0] != "error id=0 msg=ok":
+                logging.warning("authentication failed")
+                break
+
+            while True:
+                await asyncio.sleep(5)
+                # retry if the connection is closed
+                if writer.is_closing():
                     break
+                if reader.at_eof():
+                    break
+
+                # query whoami
+                whoami = await query("whoami", 2)
+                if whoami[1] != "error id=0 msg=ok":
+                    logging.warning(f"whoami failed: {whoami[1]}")
+                    break
+                # parse clid=<client id> cid=<channel id>
+                match = re.match(r"clid=(\d+) cid=(\d+)", whoami[0])
+                if match is None:
+                    continue
+                clid = int(match.group(1))
+                logging.debug(f"clid: {clid}")
+
+                # query the away status and away message
+                away = await query(
+                    f"clientvariable clid={clid} client_away client_away_message", 2
+                )
+                if away[1] != "error id=0 msg=ok":
+                    logging.warning(f"clientvariable failed: {away[1]}")
+                    break
+                # parse response: clid=<clid> client_away=<away> client_away_message=<away_text>
+                match = re.match(
+                    r"clid=\d+ client_away=(\d) client_away_message=?(.*)", away[0]
+                )
+                if match is None:
+                    continue
+                away = bool(int(match.group(1)))
+                away_message = match.group(2)
+
+                # update the state
+                status = state.update(away, away_message)
+                logging.debug(f"calculated status: {status}")
+                if status != "":
+                    # set status
+                    update = await query(
+                        f"clientupdate client_away_message={escape_space(status)}"
+                    )
+                    if update[0] != "error id=0 msg=ok":
+                        logging.warning(f"clientupdate failed: {update[0]}")
+                        break
+        except ConnectionRefusedError:
+            logging.warning("connection refused")
+            continue
+        except asyncio.TimeoutError:
+            logging.warning("timeout")
+            continue
 
 
 asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
